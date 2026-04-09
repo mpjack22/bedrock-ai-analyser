@@ -20,11 +20,6 @@ Parameters:
     Description: >
       IP address or CIDR range allowed to access the dashboard (e.g. 203.0.113.50/32).
       Use 0.0.0.0/0 to allow access from anywhere.
-  SourceBundleURL:
-    Type: String
-    Default: ''
-    Description: >
-      S3 URL of the app source bundle (tar.gz). Leave empty if uploading code manually via SSM.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -90,7 +85,7 @@ Resources:
     Type: AWS::EC2::Instance
     CreationPolicy:
       ResourceSignal:
-        Timeout: PT10M
+        Timeout: PT15M
     Properties:
       InstanceType: !Ref InstanceType
       IamInstanceProfile: !Ref InstanceProfile
@@ -110,86 +105,31 @@ Resources:
           }
           trap 'signal_cfn 1' ERR
 
-          # Install Node.js 20
+          # Install Node.js 20 and git
           dnf update -y
+          dnf install -y git
           curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
           dnf remove -y nodejs
           dnf install -y nodejs --best --allowerasing
 
-          # Create app directory
-          mkdir -p /opt/bedrock-analyser
+          # Clone the app from GitHub
+          git clone https://github.com/mpjack22/bedrock-ai-analyser.git /opt/bedrock-analyser
           cd /opt/bedrock-analyser
 
           # Write .env
-          cat > .env << 'ENVEOF'
+          cat > .env <<EOF
           AWS_REGION=${AWS::Region}
           PORT=3000
           LOGIN_USERNAME=admin
           LOGIN_PASSWORD=${AdminPassword}
-          ENVEOF
-          # Fix indentation in .env
+          EOF
           sed -i 's/^          //' .env
-
-          # Write package.json
-          cat > package.json << 'PKGEOF'
-          {
-            "name": "bedrock-ai-analyser",
-            "version": "1.0.0",
-            "type": "module",
-            "dependencies": {
-              "@aws-sdk/client-bedrock": "^3.700.0",
-              "@aws-sdk/client-bedrock-runtime": "^3.700.0",
-              "@aws-sdk/client-cloudwatch": "^3.700.0",
-              "@aws-sdk/client-service-quotas": "^3.700.0",
-              "@aws-sdk/client-sns": "^3.700.0",
-              "@aws-sdk/client-sts": "^3.700.0",
-              "@aws-sdk/client-iam": "^3.700.0",
-              "tsx": "^4.19.0",
-              "typescript": "^5.6.0"
-            },
-            "devDependencies": {
-              "@types/node": "^22.0.0"
-            }
-          }
-          PKGEOF
-          sed -i 's/^          //' package.json
-
-          # Write tsconfig.json
-          cat > tsconfig.json << 'TSCEOF'
-          {
-            "compilerOptions": {
-              "target": "ES2022",
-              "module": "ESNext",
-              "moduleResolution": "bundler",
-              "lib": ["ES2022"],
-              "outDir": "./dist",
-              "rootDir": "./src",
-              "strict": true,
-              "esModuleInterop": true,
-              "skipLibCheck": true,
-              "forceConsistentCasingInFileNames": true,
-              "resolveJsonModule": true
-            },
-            "include": ["src/**/*"],
-            "exclude": ["node_modules", "dist"]
-          }
-          TSCEOF
-          sed -i 's/^          //' tsconfig.json
-
-          # Download and extract app source
-          if [ -n "${SourceBundleURL}" ]; then
-            curl -fsSL "${SourceBundleURL}" -o /tmp/app.tar.gz
-            tar xzf /tmp/app.tar.gz -C /opt/bedrock-analyser/
-            rm /tmp/app.tar.gz
-          else
-            mkdir -p src/lib src/types src/web
-          fi
 
           # Install dependencies
           npm install
 
           # Create systemd service
-          cat > /etc/systemd/system/bedrock-analyser.service << 'SVCEOF'
+          cat > /etc/systemd/system/bedrock-analyser.service <<EOF
           [Unit]
           Description=Bedrock AI Analyser
           After=network.target
@@ -205,16 +145,12 @@ Resources:
 
           [Install]
           WantedBy=multi-user.target
-          SVCEOF
+          EOF
           sed -i 's/^          //' /etc/systemd/system/bedrock-analyser.service
 
           systemctl daemon-reload
           systemctl enable bedrock-analyser
-
-          # Start service if source code was provided
-          if [ -f /opt/bedrock-analyser/src/web/server.ts ]; then
-            systemctl start bedrock-analyser
-          fi
+          systemctl start bedrock-analyser
 
           # Signal success
           signal_cfn 0
@@ -253,8 +189,6 @@ Outputs:
   InstanceId:
     Description: EC2 Instance ID (connect via SSM)
     Value: !Ref Instance
-  NextSteps:
-    Description: Upload the app source code to complete setup
-    Value: !Sub >
-      Instance is ready. Upload the app source code to /opt/bedrock-analyser/
-      using SSM: aws ssm start-session --target ${Instance} --region ${AWS::Region}
+  LoginInfo:
+    Description: Login credentials
+    Value: 'Username: admin | Password: (the one you set during stack creation)'
