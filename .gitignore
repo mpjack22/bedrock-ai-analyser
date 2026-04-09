@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.log
+.env
+.DS_Store
+data/
+users.json
+cdk/cdk.out/
+cdk/cdk.context.json

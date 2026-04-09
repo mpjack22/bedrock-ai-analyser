@@ -1,0 +1,41 @@
+{
+  "name": "bedrock-ai-analyser",
+  "version": "1.0.0",
+  "description": "AWS Bedrock AI usage analyser and capacity planning tool",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "monitor": "tsx src/monitor.ts",
+    "predict": "tsx src/predict.ts",
+    "dashboard": "tsx src/dashboard.ts",
+    "web": "tsx src/web/server.ts",
+    "test-slack": "tsx src/test-slack.ts",
+    "generate-traffic": "tsx src/generate-traffic.ts"
+  },
+  "keywords": [
+    "aws",
+    "bedrock",
+    "ai",
+    "analyser",
+    "capacity"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@aws-sdk/client-bedrock": "^3.700.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.700.0",
+    "@aws-sdk/client-cloudwatch": "^3.700.0",
+    "@aws-sdk/client-iam": "^3.1028.0",
+    "@aws-sdk/client-service-quotas": "^3.700.0",
+    "@aws-sdk/client-sns": "^3.700.0",
+    "@aws-sdk/client-sts": "^3.1028.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

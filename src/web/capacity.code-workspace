@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "../../../jewellery-shop"
+		},
+		{
+			"path": "../.."
+		}
+	],
+	"settings": {
+		"kiroAgent.configureMCP": "Enabled"
+	}
+}
