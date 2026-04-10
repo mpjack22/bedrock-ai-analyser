@@ -117,36 +117,30 @@ Resources:
           cd /opt/bedrock-analyser
 
           # Write .env
-          cat > .env <<EOF
-          AWS_REGION=${AWS::Region}
-          PORT=3000
-          LOGIN_USERNAME=admin
-          LOGIN_PASSWORD=${AdminPassword}
-          EOF
-          sed -i 's/^          //' .env
+          echo "AWS_REGION=${AWS::Region}" > /opt/bedrock-analyser/.env
+          echo "PORT=3000" >> /opt/bedrock-analyser/.env
+          echo "LOGIN_USERNAME=admin" >> /opt/bedrock-analyser/.env
+          echo "LOGIN_PASSWORD=${AdminPassword}" >> /opt/bedrock-analyser/.env
 
           # Install dependencies
           npm install
 
           # Create systemd service
-          cat > /etc/systemd/system/bedrock-analyser.service <<EOF
-          [Unit]
-          Description=Bedrock AI Analyser
-          After=network.target
-
-          [Service]
-          Type=simple
-          User=root
-          WorkingDirectory=/opt/bedrock-analyser
-          ExecStart=/usr/bin/npx tsx src/web/server.ts
-          Restart=always
-          RestartSec=5
-          EnvironmentFile=/opt/bedrock-analyser/.env
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-          sed -i 's/^          //' /etc/systemd/system/bedrock-analyser.service
+          echo "[Unit]" > /etc/systemd/system/bedrock-analyser.service
+          echo "Description=Bedrock AI Analyser" >> /etc/systemd/system/bedrock-analyser.service
+          echo "After=network.target" >> /etc/systemd/system/bedrock-analyser.service
+          echo "" >> /etc/systemd/system/bedrock-analyser.service
+          echo "[Service]" >> /etc/systemd/system/bedrock-analyser.service
+          echo "Type=simple" >> /etc/systemd/system/bedrock-analyser.service
+          echo "User=root" >> /etc/systemd/system/bedrock-analyser.service
+          echo "WorkingDirectory=/opt/bedrock-analyser" >> /etc/systemd/system/bedrock-analyser.service
+          echo "ExecStart=/usr/bin/npx tsx src/web/server.ts" >> /etc/systemd/system/bedrock-analyser.service
+          echo "Restart=always" >> /etc/systemd/system/bedrock-analyser.service
+          echo "RestartSec=5" >> /etc/systemd/system/bedrock-analyser.service
+          echo "EnvironmentFile=/opt/bedrock-analyser/.env" >> /etc/systemd/system/bedrock-analyser.service
+          echo "" >> /etc/systemd/system/bedrock-analyser.service
+          echo "[Install]" >> /etc/systemd/system/bedrock-analyser.service
+          echo "WantedBy=multi-user.target" >> /etc/systemd/system/bedrock-analyser.service
 
           systemctl daemon-reload
           systemctl enable bedrock-analyser
