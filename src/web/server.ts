@@ -8,6 +8,8 @@ import { PredictionService } from '../lib/predictionService.js';
 import { ChatService } from '../lib/chatService.js';
 import { UserStore } from '../lib/userStore.js';
 import { config } from '../config.js';
+import { OrganizationService } from '../lib/organizationService.js';
+import { createQuotaServiceForAccount } from '../lib/v2QuotaFactory.js';
 
 const PORT = process.env.PORT || 3000;
 const LOGIN_USER = process.env.LOGIN_USERNAME || 'admin';
@@ -62,6 +64,7 @@ function clearSessionCookie(res: ServerResponse) {
 const quotaService = new QuotaService();
 const predictionService = new PredictionService();
 const chatService = new ChatService();
+const organizationService = new OrganizationService();
 
 // Cache of per-region QuotaService instances
 const regionServices = new Map<string, QuotaService>();
@@ -75,6 +78,22 @@ function getQuotaService(region: string): QuotaService {
 function getRegions(regionParam: string | null): string[] {
   if (!regionParam || regionParam === 'all') return config.bedrockRegions;
   return [regionParam];
+}
+
+/**
+ * Returns a QuotaService for the given region and optional accountId.
+ * When accountId is absent or matches the linked account, uses the existing getQuotaService.
+ * When accountId is a different account, uses createQuotaServiceForAccount for cross-account access.
+ */
+async function getQuotaServiceForRequest(region: string, accountId?: string | null) {
+  if (!accountId) {
+    return getQuotaService(region);
+  }
+  const linkedId = await organizationService.getLinkedAccountId();
+  if (accountId === linkedId) {
+    return getQuotaService(region);
+  }
+  return createQuotaServiceForAccount(organizationService, region, accountId);
 }
 
 function parseBody(req: IncomingMessage): Promise<string> {
@@ -91,10 +110,10 @@ function json(res: ServerResponse, status: number, data: unknown) {
   res.end(JSON.stringify(data));
 }
 
-async function getModels(regions: string[]): Promise<string[]> {
+async function getModels(regions: string[], accountId?: string | null): Promise<string[]> {
   const all = new Set<string>();
   await Promise.all(regions.map(async (r) => {
-    const svc = getQuotaService(r);
+    const svc = await getQuotaServiceForRequest(r, accountId);
     const models = await svc.listActiveModels();
     models.forEach(m => all.add(m));
   }));
@@ -163,108 +182,182 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       }
     }
 
+    if (url.pathname === '/api/v2/accounts') {
+      try {
+        const accounts = await organizationService.listAccounts();
+        const linkedAccountId = await organizationService.getLinkedAccountId();
+        return json(res, 200, { accounts, linkedAccountId });
+      } catch (error: any) {
+        console.error('Error fetching organization accounts:', error);
+        return json(res, 200, { accounts: [], linkedAccountId: '' });
+      }
+    }
+
     if (url.pathname === '/api/quotas') {
-      const regions = getRegions(url.searchParams.get('region'));
-      const allQuotas = await Promise.all(regions.map(r => getQuotaService(r).getBedrockQuotas()));
-      const quotas = allQuotas.flat();
-      return json(res, 200, { quotas });
+      const accountId = url.searchParams.get('accountId');
+      try {
+        const regions = getRegions(url.searchParams.get('region'));
+        const allQuotas = await Promise.all(regions.map(async (r) => {
+          const svc = await getQuotaServiceForRequest(r, accountId);
+          return svc.getBedrockQuotas();
+        }));
+        const quotas = allQuotas.flat();
+        return json(res, 200, { quotas });
+      } catch (error: any) {
+        if (error.message?.includes('BedrockAnalyserReadRole')) {
+          return json(res, 403, { error: error.message });
+        }
+        throw error;
+      }
     }
 
     if (url.pathname === '/api/usage') {
-      const regions = getRegions(url.searchParams.get('region'));
-      const hours = parseInt(url.searchParams.get('hours') || '24', 10);
-      const models = await getModels(regions);
-      const usage = [];
-      for (const modelId of models) {
-        let total = 0;
-        await Promise.all(regions.map(async (r) => {
-          total += await getQuotaService(r).getModelInvocationMetrics(modelId, hours);
-        }));
-        if (total > 0) usage.push({ modelId, invocations: total, period: hours + 'h' });
+      const accountId = url.searchParams.get('accountId');
+      try {
+        const regions = getRegions(url.searchParams.get('region'));
+        const hours = parseInt(url.searchParams.get('hours') || '24', 10);
+        const models = await getModels(regions, accountId);
+        const usage = [];
+        for (const modelId of models) {
+          let total = 0;
+          await Promise.all(regions.map(async (r) => {
+            const svc = await getQuotaServiceForRequest(r, accountId);
+            total += await svc.getModelInvocationMetrics(modelId, hours);
+          }));
+          if (total > 0) usage.push({ modelId, invocations: total, period: hours + 'h' });
+        }
+        return json(res, 200, { usage });
+      } catch (error: any) {
+        if (error.message?.includes('BedrockAnalyserReadRole')) {
+          return json(res, 403, { error: error.message });
+        }
+        throw error;
       }
-      return json(res, 200, { usage });
     }
 
     if (url.pathname === '/api/agents') {
-      const regions = getRegions(url.searchParams.get('region'));
-      let agentInvocations = 0, knowledgeBaseQueries = 0;
-      await Promise.all(regions.map(async (r) => {
-        const m = await getQuotaService(r).getAgentMetrics(24);
-        agentInvocations += m.agentInvocations;
-        knowledgeBaseQueries += m.knowledgeBaseQueries;
-      }));
-      return json(res, 200, { agentMetrics: { agentInvocations, knowledgeBaseQueries } });
+      const accountId = url.searchParams.get('accountId');
+      try {
+        const regions = getRegions(url.searchParams.get('region'));
+        let agentInvocations = 0, knowledgeBaseQueries = 0;
+        await Promise.all(regions.map(async (r) => {
+          const svc = await getQuotaServiceForRequest(r, accountId);
+          const m = await svc.getAgentMetrics(24);
+          agentInvocations += m.agentInvocations;
+          knowledgeBaseQueries += m.knowledgeBaseQueries;
+        }));
+        return json(res, 200, { agentMetrics: { agentInvocations, knowledgeBaseQueries } });
+      } catch (error: any) {
+        if (error.message?.includes('BedrockAnalyserReadRole')) {
+          return json(res, 403, { error: error.message });
+        }
+        throw error;
+      }
     }
 
     if (url.pathname === '/api/timeseries') {
-      const hours = parseInt(url.searchParams.get('hours') || '24', 10);
-      const regions = getRegions(url.searchParams.get('region'));
-      const models = await getModels(regions);
-      type MetricAgg = { sums: Map<string, number>; avgs: Map<string, number[]> };
-      const newSums = () => new Map<string, number>();
-      const newAvgs = () => new Map<string, number[]>();
-      const seriesMap = new Map<string, { invocations: Map<string, number>; inputTokens: Map<string, number>; outputTokens: Map<string, number>; latency: Map<string, number[]>; latencyP50: Map<string, number[]>; latencyP90: Map<string, number[]>; latencyP99: Map<string, number[]>; clientErrors: Map<string, number>; serverErrors: Map<string, number>; throttles: Map<string, number> }>();
-      for (const modelId of models) {
-        seriesMap.set(modelId, { invocations: newSums(), inputTokens: newSums(), outputTokens: newSums(), latency: newAvgs(), latencyP50: newAvgs(), latencyP90: newAvgs(), latencyP99: newAvgs(), clientErrors: newSums(), serverErrors: newSums(), throttles: newSums() });
-      }
-      const addSum = (m: Map<string, number>, ts: string, v: number) => m.set(ts, (m.get(ts) || 0) + v);
-      const addAvg = (m: Map<string, number[]>, ts: string, v: number) => { if (!m.has(ts)) m.set(ts, []); m.get(ts)!.push(v); };
-      await Promise.all(regions.map(async (r) => {
-        const svc = getQuotaService(r);
-        await Promise.all(models.map(async (modelId) => {
-          const ts = await svc.getModelTimeSeries(modelId, hours);
-          const e = seriesMap.get(modelId)!;
-          for (const p of ts.invocations) addSum(e.invocations, p.timestamp, p.value);
-          for (const p of ts.inputTokens) addSum(e.inputTokens, p.timestamp, p.value);
-          for (const p of ts.outputTokens) addSum(e.outputTokens, p.timestamp, p.value);
-          for (const p of ts.latency) addAvg(e.latency, p.timestamp, p.value);
-          for (const p of ts.latencyP50) addAvg(e.latencyP50, p.timestamp, p.value);
-          for (const p of ts.latencyP90) addAvg(e.latencyP90, p.timestamp, p.value);
-          for (const p of ts.latencyP99) addAvg(e.latencyP99, p.timestamp, p.value);
-          for (const p of ts.clientErrors) addSum(e.clientErrors, p.timestamp, p.value);
-          for (const p of ts.serverErrors) addSum(e.serverErrors, p.timestamp, p.value);
-          for (const p of ts.throttles) addSum(e.throttles, p.timestamp, p.value);
+      const accountId = url.searchParams.get('accountId');
+      try {
+        const hours = parseInt(url.searchParams.get('hours') || '24', 10);
+        const regions = getRegions(url.searchParams.get('region'));
+        const models = await getModels(regions, accountId);
+        type MetricAgg = { sums: Map<string, number>; avgs: Map<string, number[]> };
+        const newSums = () => new Map<string, number>();
+        const newAvgs = () => new Map<string, number[]>();
+        const seriesMap = new Map<string, { invocations: Map<string, number>; inputTokens: Map<string, number>; outputTokens: Map<string, number>; latency: Map<string, number[]>; latencyP50: Map<string, number[]>; latencyP90: Map<string, number[]>; latencyP99: Map<string, number[]>; clientErrors: Map<string, number>; serverErrors: Map<string, number>; throttles: Map<string, number> }>();
+        for (const modelId of models) {
+          seriesMap.set(modelId, { invocations: newSums(), inputTokens: newSums(), outputTokens: newSums(), latency: newAvgs(), latencyP50: newAvgs(), latencyP90: newAvgs(), latencyP99: newAvgs(), clientErrors: newSums(), serverErrors: newSums(), throttles: newSums() });
+        }
+        const addSum = (m: Map<string, number>, ts: string, v: number) => m.set(ts, (m.get(ts) || 0) + v);
+        const addAvg = (m: Map<string, number[]>, ts: string, v: number) => { if (!m.has(ts)) m.set(ts, []); m.get(ts)!.push(v); };
+        await Promise.all(regions.map(async (r) => {
+          const svc = await getQuotaServiceForRequest(r, accountId);
+          await Promise.all(models.map(async (modelId) => {
+            const ts = await svc.getModelTimeSeries(modelId, hours);
+            const e = seriesMap.get(modelId)!;
+            for (const p of ts.invocations) addSum(e.invocations, p.timestamp, p.value);
+            for (const p of ts.inputTokens) addSum(e.inputTokens, p.timestamp, p.value);
+            for (const p of ts.outputTokens) addSum(e.outputTokens, p.timestamp, p.value);
+            for (const p of ts.latency) addAvg(e.latency, p.timestamp, p.value);
+            for (const p of ts.latencyP50) addAvg(e.latencyP50, p.timestamp, p.value);
+            for (const p of ts.latencyP90) addAvg(e.latencyP90, p.timestamp, p.value);
+            for (const p of ts.latencyP99) addAvg(e.latencyP99, p.timestamp, p.value);
+            for (const p of ts.clientErrors) addSum(e.clientErrors, p.timestamp, p.value);
+            for (const p of ts.serverErrors) addSum(e.serverErrors, p.timestamp, p.value);
+            for (const p of ts.throttles) addSum(e.throttles, p.timestamp, p.value);
+          }));
         }));
-      }));
-      const series = models.map(modelId => {
-        const e = seriesMap.get(modelId)!;
-        const toArr = (m: Map<string, number>) => Array.from(m.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([timestamp, value]) => ({ timestamp, value }));
-        const toAvgArr = (m: Map<string, number[]>) => Array.from(m.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([timestamp, vals]) => ({ timestamp, value: vals.reduce((a, b) => a + b, 0) / vals.length }));
-        return { modelId, invocations: toArr(e.invocations), inputTokens: toArr(e.inputTokens), outputTokens: toArr(e.outputTokens), latency: toAvgArr(e.latency), latencyP50: toAvgArr(e.latencyP50), latencyP90: toAvgArr(e.latencyP90), latencyP99: toAvgArr(e.latencyP99), clientErrors: toArr(e.clientErrors), serverErrors: toArr(e.serverErrors), throttles: toArr(e.throttles) };
-      });
-      return json(res, 200, { series, hours });
+        const series = models.map(modelId => {
+          const e = seriesMap.get(modelId)!;
+          const toArr = (m: Map<string, number>) => Array.from(m.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([timestamp, value]) => ({ timestamp, value }));
+          const toAvgArr = (m: Map<string, number[]>) => Array.from(m.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([timestamp, vals]) => ({ timestamp, value: vals.reduce((a, b) => a + b, 0) / vals.length }));
+          return { modelId, invocations: toArr(e.invocations), inputTokens: toArr(e.inputTokens), outputTokens: toArr(e.outputTokens), latency: toAvgArr(e.latency), latencyP50: toAvgArr(e.latencyP50), latencyP90: toAvgArr(e.latencyP90), latencyP99: toAvgArr(e.latencyP99), clientErrors: toArr(e.clientErrors), serverErrors: toArr(e.serverErrors), throttles: toArr(e.throttles) };
+        });
+        return json(res, 200, { series, hours });
+      } catch (error: any) {
+        if (error.message?.includes('BedrockAnalyserReadRole')) {
+          return json(res, 403, { error: error.message });
+        }
+        throw error;
+      }
     }
 
     if (url.pathname === '/api/active-models') {
-      const regions = getRegions(url.searchParams.get('region'));
-      const models = await getModels(regions);
-      return json(res, 200, { models });
+      const accountId = url.searchParams.get('accountId');
+      try {
+        const regions = getRegions(url.searchParams.get('region'));
+        const allModels = new Set<string>();
+        await Promise.all(regions.map(async (r) => {
+          const svc = await getQuotaServiceForRequest(r, accountId);
+          const models = await svc.listActiveModels();
+          models.forEach(m => allModels.add(m));
+        }));
+        const models = allModels.size > 0 ? Array.from(allModels) : config.models;
+        return json(res, 200, { models });
+      } catch (error: any) {
+        if (error.message?.includes('BedrockAnalyserReadRole')) {
+          return json(res, 403, { error: error.message });
+        }
+        throw error;
+      }
     }
 
     if (url.pathname === '/api/predictions') {
-      const regions = getRegions(url.searchParams.get('region'));
-      const allQuotas = await Promise.all(regions.map(r => getQuotaService(r).getBedrockQuotas()));
-      const quotas = allQuotas.flat();
-      const invocationQuota = quotas.find(q => q.quotaName.toLowerCase().includes('invocation'));
-      const models = await getModels(regions);
-      const predictions = [];
-      for (const modelId of models) {
-        let totalInvocations = 0;
-        await Promise.all(regions.map(async (r) => {
-          totalInvocations += await getQuotaService(r).getModelInvocationMetrics(modelId, 168);
+      const accountId = url.searchParams.get('accountId');
+      try {
+        const regions = getRegions(url.searchParams.get('region'));
+        const allQuotas = await Promise.all(regions.map(async (r) => {
+          const svc = await getQuotaServiceForRequest(r, accountId);
+          return svc.getBedrockQuotas();
         }));
-        for (let i = 0; i < 7; i++) {
-          predictionService.addUsageData(modelId, {
-            timestamp: new Date(Date.now() - (6 - i) * 24 * 60 * 60 * 1000),
-            modelId,
-            invocations: totalInvocations * (0.7 + i * 0.05),
-            inputTokens: 0,
-            outputTokens: 0,
-          });
+        const quotas = allQuotas.flat();
+        const invocationQuota = quotas.find(q => q.quotaName.toLowerCase().includes('invocation'));
+        const models = await getModels(regions, accountId);
+        const predictions = [];
+        for (const modelId of models) {
+          let totalInvocations = 0;
+          await Promise.all(regions.map(async (r) => {
+            const svc = await getQuotaServiceForRequest(r, accountId);
+            totalInvocations += await svc.getModelInvocationMetrics(modelId, 168);
+          }));
+          for (let i = 0; i < 7; i++) {
+            predictionService.addUsageData(modelId, {
+              timestamp: new Date(Date.now() - (6 - i) * 24 * 60 * 60 * 1000),
+              modelId,
+              invocations: totalInvocations * (0.7 + i * 0.05),
+              inputTokens: 0,
+              outputTokens: 0,
+            });
+          }
+          predictions.push(predictionService.predictExhaustion(modelId, invocationQuota?.value || 1000000));
         }
-        predictions.push(predictionService.predictExhaustion(modelId, invocationQuota?.value || 1000000));
+        return json(res, 200, { predictions });
+      } catch (error: any) {
+        if (error.message?.includes('BedrockAnalyserReadRole')) {
+          return json(res, 403, { error: error.message });
+        }
+        throw error;
       }
-      return json(res, 200, { predictions });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/chat') {
@@ -625,6 +718,14 @@ function getHTML(username: string, role: string) {
     .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--muted); }
     .btn-outline.active { border-color: var(--accent); color: var(--accent); }
     select { background: var(--surface); color: var(--text); border: 1px solid var(--border); padding: 8px 12px; border-radius: 8px; font-size: 13px; }
+    .acct-selector { position: relative; }
+    .acct-selector input { background: var(--surface); color: var(--text); border: 1px solid var(--border); padding: 8px 12px; border-radius: 8px; font-size: 13px; width: 220px; outline: none; }
+    .acct-selector input:focus { border-color: var(--accent); }
+    .acct-dropdown { display: none; position: absolute; top: 100%; left: 0; margin-top: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 4px 0; z-index: 200; min-width: 280px; max-height: 240px; overflow-y: auto; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+    .acct-dropdown.open { display: block; }
+    .acct-dropdown-item { padding: 8px 12px; font-size: 13px; cursor: pointer; color: var(--text); }
+    .acct-dropdown-item:hover { background: var(--surface2); }
+    .acct-dropdown-item.selected { color: var(--accent); }
     .badge { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: 11px; font-weight: 700; }
     .badge-ok { background: rgba(34,197,94,.15); color: var(--green); }
     .badge-warn { background: rgba(234,179,8,.15); color: var(--yellow); }
@@ -675,6 +776,10 @@ function getHTML(username: string, role: string) {
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
       <div style="display:flex;align-items:center;gap:10px">
         <span style="color:var(--muted);font-size:12px;background:var(--surface2);padding:4px 10px;border-radius:6px" id="accountBadge">Account: ...</span>
+        <div class="acct-selector">
+          <input id="acctSearch" type="text" placeholder="Current Account" onfocus="openAcctDropdown()" oninput="filterAccounts(this.value)" autocomplete="off" />
+          <div id="acctDropdown" class="acct-dropdown"></div>
+        </div>
         <span style="color:var(--muted);font-size:13px">Region</span>
         <select id="regionSelect" onchange="setRegion(this.value)" style="background:var(--surface);color:var(--text);border:1px solid var(--border);padding:8px 12px;border-radius:8px;font-size:13px">
           ${config.bedrockRegions.map(r => `<option value="${r}"${r === 'us-east-1' ? ' selected' : ''}>${r}</option>`).join('\n          ')}
@@ -865,12 +970,73 @@ function getHTML(username: string, role: string) {
 const COLORS = ['#3b82f6','#8b5cf6','#22c55e','#eab308','#ef4444','#f97316','#06b6d4','#ec4899'];
 let currentHours = 24;
 let currentRegion = 'us-east-1';
+let currentAccountId = '';
+let orgAccounts = [];
 let charts = {};
 let allModels = [];
 let selectedModels = new Set();
 let quotaLimits = { invocations: null, inputTokens: null, outputTokens: null };
 
 function regionParam() { return 'region=' + currentRegion; }
+function accountParam() { return currentAccountId ? '&accountId=' + currentAccountId : ''; }
+
+async function loadAccounts() {
+  try {
+    var res = await fetch('/api/v2/accounts');
+    var data = await res.json();
+    orgAccounts = data.accounts || [];
+    renderAcctDropdown(orgAccounts);
+  } catch (e) {
+    orgAccounts = [];
+    renderAcctDropdown([]);
+  }
+}
+
+function renderAcctDropdown(accounts) {
+  var dd = document.getElementById('acctDropdown');
+  var html = '<div class="acct-dropdown-item' + (!currentAccountId ? ' selected' : '') + '" onclick="selectAccount(\\'\\', \\'Current Account\\')">Current Account</div>';
+  accounts.forEach(function(a) {
+    var display = a.accountName + ' (' + a.accountId + ')';
+    var sel = currentAccountId === a.accountId ? ' selected' : '';
+    html += '<div class="acct-dropdown-item' + sel + '" onclick="selectAccount(\\'' + a.accountId + '\\', \\'' + display.replace(/'/g, "\\\\'") + '\\')">' + display + '</div>';
+  });
+  dd.innerHTML = html;
+}
+
+function filterAccounts(query) {
+  if (!query) { renderAcctDropdown(orgAccounts); return; }
+  var q = query.toLowerCase();
+  var filtered = orgAccounts.filter(function(a) {
+    return a.accountName.toLowerCase().indexOf(q) !== -1 || a.accountId.toLowerCase().indexOf(q) !== -1;
+  });
+  renderAcctDropdown(filtered);
+  document.getElementById('acctDropdown').classList.add('open');
+}
+
+function openAcctDropdown() {
+  renderAcctDropdown(orgAccounts);
+  document.getElementById('acctDropdown').classList.add('open');
+}
+
+function selectAccount(accountId, displayName) {
+  currentAccountId = accountId;
+  document.getElementById('acctSearch').value = displayName;
+  document.getElementById('acctDropdown').classList.remove('open');
+  if (accountId) {
+    document.getElementById('accountBadge').textContent = displayName;
+  } else {
+    loadAccount();
+  }
+  loadAll();
+}
+
+// Close account dropdown when clicking outside
+document.addEventListener('click', function(e) {
+  var sel = document.querySelector('.acct-selector');
+  if (sel && !sel.contains(e.target)) {
+    document.getElementById('acctDropdown').classList.remove('open');
+  }
+});
 
 function isModelSelected(modelId) {
   return selectedModels.size === 0 || selectedModels.has(modelId);
@@ -1051,8 +1217,10 @@ function makeChart(id, type, data, options = {}) {
 
 async function loadTimeSeries() {
   try {
-    const res = await fetch('/api/timeseries?hours=' + currentHours + '&' + regionParam());
-    const { series: rawSeries } = await res.json();
+    const res = await fetch('/api/timeseries?hours=' + currentHours + '&' + regionParam() + accountParam());
+    const data = await res.json();
+    if (data.error) { console.warn('timeseries:', data.error); return; }
+    const rawSeries = data.series || [];
     const series = rawSeries.filter(s => isModelSelected(s.modelId));
 
     // Calculate period in minutes for per-minute rate conversion
@@ -1203,8 +1371,10 @@ async function loadTimeSeries() {
 
 async function loadUsagePie() {
   try {
-    const res = await fetch('/api/usage?hours=' + (currentHours || 24) + '&' + regionParam());
-    const { usage: rawUsage } = await res.json();
+    const res = await fetch('/api/usage?hours=' + (currentHours || 24) + '&' + regionParam() + accountParam());
+    const data = await res.json();
+    if (data.error) { document.getElementById('totalInvocations').textContent = '—'; return; }
+    const rawUsage = data.usage || [];
     const usage = rawUsage.filter(u => isModelSelected(u.modelId));
     const labels = usage.map(u => shortName(u.modelId));
     const values = usage.map(u => u.invocations);
@@ -1222,17 +1392,21 @@ async function loadUsagePie() {
 
 async function loadAgents() {
   try {
-    const res = await fetch('/api/agents?' + regionParam());
-    const { agentMetrics } = await res.json();
+    const res = await fetch('/api/agents?' + regionParam() + accountParam());
+    const data = await res.json();
+    if (data.error) { document.getElementById('agentInv').textContent = '—'; document.getElementById('kbQueries').textContent = '—'; return; }
+    const agentMetrics = data.agentMetrics || {};
     document.getElementById('agentInv').textContent = (agentMetrics.agentInvocations || 0).toLocaleString();
     document.getElementById('kbQueries').textContent = (agentMetrics.knowledgeBaseQueries || 0).toLocaleString();
-  } catch (e) { console.error('agents error', e); }
+  } catch (e) { document.getElementById('agentInv').textContent = '—'; document.getElementById('kbQueries').textContent = '—'; }
 }
 
 async function loadActiveModels() {
   try {
-    const res = await fetch('/api/active-models?' + regionParam());
-    const { models } = await res.json();
+    const res = await fetch('/api/active-models?' + regionParam() + accountParam());
+    const data = await res.json();
+    if (data.error) { document.getElementById('activeModels').textContent = '—'; return; }
+    const models = data.models || [];
     document.getElementById('activeModels').textContent = models.length || config_models_count;
     // Update model filter if the list changed
     if (JSON.stringify(models.sort()) !== JSON.stringify(allModels.sort())) {
@@ -1246,9 +1420,11 @@ const config_models_count = ${config.models.length};
 
 async function loadQuotas() {
   try {
-    const res = await fetch('/api/quotas?' + regionParam());
-    const { quotas } = await res.json();
+    const res = await fetch('/api/quotas?' + regionParam() + accountParam());
+    const data = await res.json();
     const el = document.getElementById('quotasList');
+    if (data.error) { el.innerHTML = '<div class="loading">' + data.error + '</div>'; return; }
+    const quotas = data.quotas || [];
     if (!quotas.length) { el.innerHTML = '<div class="loading">No quotas found</div>'; return; }
     el.innerHTML = quotas.slice(0, 15).map(q => \`
       <div class="quota-row">
@@ -1269,8 +1445,10 @@ async function loadQuotas() {
 
 async function loadPredictions() {
   try {
-    const res = await fetch('/api/predictions?' + regionParam());
-    const { predictions: rawPredictions } = await res.json();
+    const res = await fetch('/api/predictions?' + regionParam() + accountParam());
+    const data = await res.json();
+    if (data.error) { document.getElementById('predictionsList').innerHTML = '<div class="loading">' + data.error + '</div>'; return; }
+    const rawPredictions = data.predictions || [];
     const predictions = rawPredictions.filter(p => isModelSelected(p.modelId));
     const el = document.getElementById('predictionsList');
     if (!predictions.length) { el.innerHTML = '<div class="loading">No predictions</div>'; return; }
@@ -1340,7 +1518,7 @@ async function showIncreasePanel() {
   regionSel.value = currentRegion === 'all' ? '${config.region}' : currentRegion;
   // Load quotas for the selected increase region
   try {
-    const res = await fetch('/api/quotas?region=' + regionSel.value);
+    const res = await fetch('/api/quotas?region=' + regionSel.value + accountParam());
     const { quotas } = await res.json();
     const sel = document.getElementById('incQuota');
     sel.innerHTML = quotas
@@ -1388,7 +1566,9 @@ async function submitIncrease() {
 
 async function loadAccount() {
   try {
-    var res = await fetch('/api/account');
+    var url = '/api/account';
+    if (currentAccountId) url += '?accountId=' + currentAccountId;
+    var res = await fetch(url);
     var data = await res.json();
     var label = data.accountName
       ? data.accountName + ' (' + data.accountId + ')'
@@ -1404,6 +1584,7 @@ async function loadAll() {
 }
 
 loadAccount();
+loadAccounts();
 loadAll();
 setInterval(loadAll, 300000);
 </script>

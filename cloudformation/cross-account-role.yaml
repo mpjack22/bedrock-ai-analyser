@@ -1,0 +1,50 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock AI Analyser - Cross-Account Read Role.
+  Deploy this template as a CloudFormation StackSet to member accounts
+  to enable the Bedrock AI Analyser to read metrics cross-account.
+
+Parameters:
+  LinkedAccountId:
+    Type: String
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID
+    Description: AWS Account ID where the Bedrock AI Analyser is deployed
+
+Resources:
+  BedrockAnalyserReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BedrockAnalyserReadRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${LinkedAccountId}:root'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockAnalyserReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetMetricData
+                  - servicequotas:ListServiceQuotas
+                  - servicequotas:GetServiceQuota
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - sts:GetCallerIdentity
+                  - iam:ListAccountAliases
+                Resource: '*'
+
+Outputs:
+  RoleArn:
+    Description: ARN of the BedrockAnalyserReadRole created in this account
+    Value: !GetAtt BedrockAnalyserReadRole.Arn
+  LinkedAccountId:
+    Description: The Linked Account ID trusted by this role
+    Value: !Ref LinkedAccountId
