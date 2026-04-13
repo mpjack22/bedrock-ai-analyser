@@ -39,7 +39,7 @@ User Question: ${userMessage}`;
     try {
       const response = await this.bedrockClient.send(
         new InvokeModelCommand({
-          modelId: 'anthropic.claude-3-haiku-20240307-v1:0',
+          modelId: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
           contentType: 'application/json',
           accept: 'application/json',
           body: JSON.stringify({
