@@ -77,8 +77,8 @@ async function runBatch(batchNum: number, totalBatches: number) {
 }
 
 async function main() {
-  const durationMinutes = parseInt(process.argv[2] || '30', 10);
-  const intervalSeconds = parseInt(process.argv[3] || '60', 10);
+  const durationMinutes = parseInt(process.argv[2] || '15', 10);
+  const intervalSeconds = parseInt(process.argv[3] || '30', 10);
   const totalBatches = Math.ceil((durationMinutes * 60) / intervalSeconds);
 
   console.log(`🔄 Generating Bedrock traffic`);

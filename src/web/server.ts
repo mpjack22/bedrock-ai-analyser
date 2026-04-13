@@ -302,6 +302,36 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       }
     }
 
+    if (url.pathname === '/api/agent-timeseries') {
+      const accountId = url.searchParams.get('accountId');
+      try {
+        const hours = parseInt(url.searchParams.get('hours') || '24', 10);
+        const regions = getRegions(url.searchParams.get('region'));
+        const keys = ['agentInvocations','agentLatency','agentLatencyP50','agentLatencyP90','agentLatencyP99','agentErrors','agentStepCount','kbRetrieveCount','kbRetrieveLatency','kbErrors','guardrailInvocations','guardrailInterventions'] as const;
+        const sums = new Map<string, Map<string, number>>();
+        const avgs = new Map<string, Map<string, number[]>>();
+        const avgKeys = new Set(['agentLatency','agentLatencyP50','agentLatencyP90','agentLatencyP99','kbRetrieveLatency']);
+        for (const k of keys) { if (avgKeys.has(k)) avgs.set(k, new Map()); else sums.set(k, new Map()); }
+        await Promise.all(regions.map(async (r) => {
+          const svc = await getQuotaServiceForRequest(r, accountId);
+          const ts = await svc.getAgentTimeSeries(hours);
+          for (const k of keys) {
+            const points = ts[k] as { timestamp: string; value: number }[];
+            if (avgKeys.has(k)) { const m = avgs.get(k)!; for (const p of points) { if (!m.has(p.timestamp)) m.set(p.timestamp, []); m.get(p.timestamp)!.push(p.value); } }
+            else { const m = sums.get(k)!; for (const p of points) m.set(p.timestamp, (m.get(p.timestamp) || 0) + p.value); }
+          }
+        }));
+        const toArr = (m: Map<string, number>) => Array.from(m.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([t, v]) => ({ timestamp: t, value: v }));
+        const toAvg = (m: Map<string, number[]>) => Array.from(m.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([t, vs]) => ({ timestamp: t, value: vs.reduce((a, b) => a + b, 0) / vs.length }));
+        const result: any = {};
+        for (const k of keys) { result[k] = avgKeys.has(k) ? toAvg(avgs.get(k)!) : toArr(sums.get(k)!); }
+        return json(res, 200, result);
+      } catch (error: any) {
+        if (error.message?.includes('BedrockAnalyserReadRole')) return json(res, 403, { error: error.message });
+        throw error;
+      }
+    }
+
     if (url.pathname === '/api/active-models') {
       const accountId = url.searchParams.get('accountId');
       try {
@@ -816,13 +846,15 @@ function getHTML(username: string, role: string) {
 
   <!-- Chat Agent -->
   <div class="card" style="margin-bottom:20px">
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;cursor:pointer" onclick="toggleChat()">
       <span style="font-size:22px">🤖</span>
-      <div>
+      <div style="flex:1">
         <div style="font-size:15px;font-weight:600">Capacity Assistant</div>
         <div style="font-size:12px;color:var(--muted)">Ask about usage, predictions, limits, or request a quota increase</div>
       </div>
+      <span id="chatToggleIcon" style="font-size:18px;color:var(--muted)">▼</span>
     </div>
+    <div id="chatBody">
     <div id="chatMsgs" style="max-height:300px;overflow-y:auto;margin-bottom:14px;display:flex;flex-direction:column;gap:10px">
       <div class="msg bot"><div class="bubble">Hi! I can help you understand your Bedrock usage, predict when you might hit limits, and guide you through requesting quota increases. Try asking:<br><br>
         • <em>Which models are closest to their limits?</em><br>
@@ -879,6 +911,7 @@ function getHTML(username: string, role: string) {
       <div id="increaseResult" style="margin-top:10px;font-size:13px"></div>
     </div>
   </div>
+  </div>
 
   <!-- Summary cards -->
   <div class="grid grid-4" id="summaryCards">
@@ -888,7 +921,18 @@ function getHTML(username: string, role: string) {
     <div class="card"><div class="card-title">KB Queries</div><div class="stat-value" id="kbQueries">—</div><div class="stat-sub">Knowledge Base</div></div>
   </div>
 
+  <!-- View Selector -->
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+    <span style="color:var(--muted);font-size:13px">View</span>
+    <select id="viewSelect" onchange="setView(this.value)" style="background:var(--surface);color:var(--text);border:1px solid var(--border);padding:8px 12px;border-radius:8px;font-size:13px">
+      <option value="all" selected>All Metrics</option>
+      <option value="model">Model</option>
+      <option value="agent">AgentCore</option>
+    </select>
+  </div>
+
   <!-- Charts -->
+  <div id="modelCharts">
   <div class="grid grid-2">
     <div class="card">
       <div class="card-title">Tokens Per Minute (TPM)</div>
@@ -948,6 +992,48 @@ function getHTML(username: string, role: string) {
       <div class="chart-desc">Percentage of requests that were throttled. Any value above 0% means you're hitting capacity limits and should consider requesting a quota increase.</div>
       <div class="chart-wrap"><canvas id="throttleRateChart"></canvas></div>
     </div>
+  </div>
+  </div>
+
+  <!-- AgentCore Metrics -->
+  <div id="agentCharts">
+  <div style="margin-bottom:8px;margin-top:24px"><span style="font-size:16px;font-weight:600;color:var(--accent)">🤖 AgentCore Metrics</span></div>
+  <div class="grid grid-2">
+    <div class="card">
+      <div class="card-title">Agent Invocations & Errors</div>
+      <div class="chart-desc">Agent invocation volume and error count. Rising errors may indicate misconfigured agents or downstream tool failures.</div>
+      <div class="chart-wrap"><canvas id="agentInvChart"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Agent Latency (p50 / p90 / p99)</div>
+      <div class="chart-desc">End-to-end agent response time. Includes all tool calls and LLM invocations within the agent workflow.</div>
+      <div class="chart-wrap"><canvas id="agentLatencyChart"></canvas></div>
+    </div>
+  </div>
+  <div class="grid grid-2">
+    <div class="card">
+      <div class="card-title">Agent Step Count</div>
+      <div class="chart-desc">Number of steps (tool calls / reasoning loops) per agent invocation. More steps = higher cost and latency.</div>
+      <div class="chart-wrap"><canvas id="agentStepChart"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Knowledge Base Retrieval</div>
+      <div class="chart-desc">RAG retrieval volume, latency, and errors. High latency may indicate large vector stores or complex queries.</div>
+      <div class="chart-wrap"><canvas id="kbChart"></canvas></div>
+    </div>
+  </div>
+  <div class="grid grid-2">
+    <div class="card">
+      <div class="card-title">Guardrail Activity</div>
+      <div class="chart-desc">Guardrail invocations vs interventions (blocked content). A high intervention rate may indicate overly strict rules or misuse attempts.</div>
+      <div class="chart-wrap"><canvas id="guardrailChart"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Knowledge Base Errors</div>
+      <div class="chart-desc">Failed retrieval operations. Persistent errors may indicate index issues, permission problems, or data source connectivity.</div>
+      <div class="chart-wrap"><canvas id="kbErrorChart"></canvas></div>
+    </div>
+  </div>
   </div>
 
   <!-- Quotas & Predictions -->
@@ -1133,6 +1219,26 @@ function setRange(h) {
 function setRegion(r) {
   currentRegion = r;
   loadAll();
+}
+
+function setView(v) {
+  var model = document.getElementById('modelCharts');
+  var agent = document.getElementById('agentCharts');
+  if (v === 'model') { model.style.display = ''; agent.style.display = 'none'; }
+  else if (v === 'agent') { model.style.display = 'none'; agent.style.display = ''; }
+  else { model.style.display = ''; agent.style.display = ''; }
+}
+
+function toggleChat() {
+  var body = document.getElementById('chatBody');
+  var icon = document.getElementById('chatToggleIcon');
+  if (body.style.display === 'none') {
+    body.style.display = '';
+    icon.textContent = '▼';
+  } else {
+    body.style.display = 'none';
+    icon.textContent = '▶';
+  }
 }
 
 async function refresh() {
@@ -1577,14 +1683,59 @@ async function loadAccount() {
   } catch (e) { }
 }
 
+async function loadAgentTimeSeries() {
+  try {
+    var res = await fetch('/api/agent-timeseries?hours=' + (currentHours || 24) + '&' + regionParam() + accountParam());
+    var data = await res.json();
+    if (data.error) return;
+
+    // Agent Invocations & Errors
+    var invDs = [];
+    if (data.agentInvocations && data.agentInvocations.length) invDs.push({ label: 'Invocations', data: data.agentInvocations.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#3b82f6', backgroundColor: '#3b82f620', fill: true, tension: .3, pointRadius: 2, borderWidth: 2 });
+    if (data.agentErrors && data.agentErrors.length) invDs.push({ label: 'Errors', data: data.agentErrors.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#ef4444', backgroundColor: '#ef444420', fill: true, tension: .3, pointRadius: 2, borderWidth: 2 });
+    makeChart('agentInvChart', 'line', { datasets: invDs.length ? invDs : [{ label: 'No data', data: [] }] });
+
+    // Agent Latency Percentiles
+    var latDs = [];
+    if (data.agentLatencyP50 && data.agentLatencyP50.length) latDs.push({ label: 'p50', data: data.agentLatencyP50.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#22c55e', borderWidth: 1.5, borderDash: [2, 2], tension: .3, pointRadius: 1, fill: false });
+    if (data.agentLatencyP90 && data.agentLatencyP90.length) latDs.push({ label: 'p90', data: data.agentLatencyP90.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#eab308', borderWidth: 2, tension: .3, pointRadius: 1, fill: false });
+    if (data.agentLatencyP99 && data.agentLatencyP99.length) latDs.push({ label: 'p99', data: data.agentLatencyP99.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#ef4444', borderWidth: 2, borderDash: [6, 3], tension: .3, pointRadius: 1, fill: false });
+    if (data.agentLatency && data.agentLatency.length) latDs.push({ label: 'avg', data: data.agentLatency.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#3b82f6', borderWidth: 2, tension: .3, pointRadius: 1, fill: false });
+    makeChart('agentLatencyChart', 'line', { datasets: latDs.length ? latDs : [{ label: 'No data', data: [] }] });
+
+    // Agent Step Count
+    var stepDs = [];
+    if (data.agentStepCount && data.agentStepCount.length) stepDs.push({ label: 'Steps', data: data.agentStepCount.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#8b5cf6', backgroundColor: '#8b5cf620', fill: true, tension: .3, pointRadius: 2, borderWidth: 2 });
+    makeChart('agentStepChart', 'line', { datasets: stepDs.length ? stepDs : [{ label: 'No data', data: [] }] });
+
+    // Knowledge Base Retrieval
+    var kbDs = [];
+    if (data.kbRetrieveCount && data.kbRetrieveCount.length) kbDs.push({ label: 'Retrievals', data: data.kbRetrieveCount.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#06b6d4', backgroundColor: '#06b6d420', fill: true, tension: .3, pointRadius: 2, borderWidth: 2 });
+    if (data.kbRetrieveLatency && data.kbRetrieveLatency.length) kbDs.push({ label: 'Latency (ms)', data: data.kbRetrieveLatency.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#f97316', borderWidth: 2, tension: .3, pointRadius: 1, fill: false, yAxisID: 'y1' });
+    makeChart('kbChart', 'line', { datasets: kbDs.length ? kbDs : [{ label: 'No data', data: [] }] });
+
+    // Guardrail Activity
+    var grDs = [];
+    if (data.guardrailInvocations && data.guardrailInvocations.length) grDs.push({ label: 'Invocations', data: data.guardrailInvocations.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#3b82f6', backgroundColor: '#3b82f620', fill: true, tension: .3, pointRadius: 2, borderWidth: 2 });
+    if (data.guardrailInterventions && data.guardrailInterventions.length) grDs.push({ label: 'Blocked', data: data.guardrailInterventions.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#ef4444', backgroundColor: '#ef444420', fill: true, tension: .3, pointRadius: 2, borderWidth: 2 });
+    makeChart('guardrailChart', 'line', { datasets: grDs.length ? grDs : [{ label: 'No data', data: [] }] });
+
+    // KB Errors
+    var kbErrDs = [];
+    if (data.kbErrors && data.kbErrors.length) kbErrDs.push({ label: 'Errors', data: data.kbErrors.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#ef4444', backgroundColor: '#ef444420', fill: true, tension: .3, pointRadius: 2, borderWidth: 2 });
+    makeChart('kbErrorChart', 'line', { datasets: kbErrDs.length ? kbErrDs : [{ label: 'No data', data: [] }] });
+  } catch (e) { console.error('agent timeseries error', e); }
+}
+
 async function loadAll() {
   document.getElementById('lastUpdate').textContent = 'Last updated: ' + new Date().toLocaleString();
   await Promise.all([loadQuotas(), loadActiveModels(), loadAgents()]);
-  await Promise.all([loadTimeSeries(), loadUsagePie(), loadPredictions()]);
+  await Promise.all([loadTimeSeries(), loadUsagePie(), loadPredictions(), loadAgentTimeSeries()]);
 }
 
 loadAccount();
 loadAccounts();
+setView('all');
 loadAll();
 setInterval(loadAll, 300000);
 </script>

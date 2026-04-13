@@ -4,7 +4,7 @@ import { config } from '../config.js';
 import { QuotaService } from './quotaService.js';
 import { OrganizationService, type AssumedCredentials } from './organizationService.js';
 import type { QuotaInfo, QuotaStatus } from '../types/index.js';
-import type { TimeSeriesPoint, ModelTimeSeries } from './quotaService.js';
+import type { TimeSeriesPoint, ModelTimeSeries, AgentTimeSeries } from './quotaService.js';
 
 export class CrossAccountQuotaService {
   private quotasClient: ServiceQuotasClient;
@@ -229,6 +229,39 @@ export class CrossAccountQuotaService {
       console.error('Error fetching agent metrics:', error);
       return { agentInvocations: 0, knowledgeBaseQueries: 0 };
     }
+  }
+
+  async getAgentTimeSeries(hours: number = 24): Promise<AgentTimeSeries> {
+    const endTime = new Date();
+    const startTime = new Date(endTime.getTime() - hours * 60 * 60 * 1000);
+    const period = hours <= 1 ? 300 : hours <= 12 ? 900 : hours <= 72 ? 3600 : 86400;
+
+    const fetchAgentMetric = async (metricName: string, stat: string): Promise<TimeSeriesPoint[]> => {
+      const allPoints = new Map<string, number>();
+      const isExtended = stat.startsWith('p');
+      for (const ns of ['AWS/Bedrock', 'AWS/BedrockAgent']) {
+        try {
+          const params: any = { Namespace: ns, MetricName: metricName, StartTime: startTime, EndTime: endTime, Period: period };
+          if (isExtended) { params.ExtendedStatistics = [stat]; } else { params.Statistics = [stat as Statistic]; }
+          const response = await this.cloudwatchClient.send(new GetMetricStatisticsCommand(params));
+          for (const dp of response.Datapoints || []) {
+            const ts = dp.Timestamp?.toISOString() || '';
+            let val = 0;
+            if (isExtended && dp.ExtendedStatistics) { val = dp.ExtendedStatistics[stat] || 0; } else { val = (dp as any)[stat] || 0; }
+            allPoints.set(ts, (allPoints.get(ts) || 0) + val);
+          }
+        } catch { }
+      }
+      return Array.from(allPoints.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([timestamp, value]) => ({ timestamp, value }));
+    };
+
+    const [agentInvocations, agentLatency, agentLatencyP50, agentLatencyP90, agentLatencyP99, agentErrors, agentStepCount, kbRetrieveCount, kbRetrieveLatency, kbErrors, guardrailInvocations, guardrailInterventions] = await Promise.all([
+      fetchAgentMetric('Invocations', 'Sum'), fetchAgentMetric('Latency', 'Average'), fetchAgentMetric('Latency', 'p50'), fetchAgentMetric('Latency', 'p90'), fetchAgentMetric('Latency', 'p99'),
+      fetchAgentMetric('InvocationErrors', 'Sum'), fetchAgentMetric('StepCount', 'Sum'), fetchAgentMetric('RetrieveCount', 'Sum'), fetchAgentMetric('RetrieveLatency', 'Average'),
+      fetchAgentMetric('RetrieveErrors', 'Sum'), fetchAgentMetric('GuardrailInvocations', 'Sum'), fetchAgentMetric('GuardrailInterventions', 'Sum'),
+    ]);
+
+    return { agentInvocations, agentLatency, agentLatencyP50, agentLatencyP90, agentLatencyP99, agentErrors, agentStepCount, kbRetrieveCount, kbRetrieveLatency, kbErrors, guardrailInvocations, guardrailInterventions };
   }
 }
 
