@@ -166,6 +166,158 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       return;
     }
 
+    if (url.pathname === '/api/debug') {
+      if (!isAdmin(req)) return json(res, 403, { error: 'Admin access required' });
+      const region = url.searchParams.get('region') || config.region;
+      const modelId = url.searchParams.get('modelId') || config.models[0];
+      const hours = parseInt(url.searchParams.get('hours') || '1', 10);
+      const accountId = url.searchParams.get('accountId');
+
+      const endTime = new Date();
+      const startTime = new Date(endTime.getTime() - hours * 60 * 60 * 1000);
+      const period = hours <= 1 ? 300 : hours <= 12 ? 900 : 3600;
+
+      const svc = await getQuotaServiceForRequest(region, accountId);
+      const results: Record<string, any> = {
+        query: { region, modelId, hours, period, startTime: startTime.toISOString(), endTime: endTime.toISOString(), accountId: accountId || 'linked account' },
+        namespaces: {},
+      };
+
+      for (const ns of ['AWS/Bedrock', 'AWS/BedrockRuntime']) {
+        results.namespaces[ns] = {};
+        for (const metric of ['Invocations', 'InputTokenCount', 'OutputTokenCount', 'InvocationLatency', 'InvocationClientErrors', 'InvocationServerErrors', 'InvocationThrottles']) {
+          try {
+            const { CloudWatchClient, GetMetricStatisticsCommand } = await import('@aws-sdk/client-cloudwatch');
+            const cw = new (CloudWatchClient as any)({ region });
+            const resp = await cw.send(new (GetMetricStatisticsCommand as any)({
+              Namespace: ns,
+              MetricName: metric,
+              Dimensions: [{ Name: 'ModelId', Value: modelId }],
+              StartTime: startTime,
+              EndTime: endTime,
+              Period: period,
+              Statistics: ['Sum', 'Average', 'Maximum'],
+            }));
+            const datapoints = (resp.Datapoints || []).sort((a: any, b: any) => new Date(a.Timestamp).getTime() - new Date(b.Timestamp).getTime());
+            results.namespaces[ns][metric] = {
+              datapointCount: datapoints.length,
+              totalSum: datapoints.reduce((s: number, d: any) => s + (d.Sum || 0), 0),
+              datapoints: datapoints.map((d: any) => ({
+                timestamp: d.Timestamp,
+                sum: d.Sum,
+                average: d.Average,
+                maximum: d.Maximum,
+              })),
+            };
+          } catch (err: any) {
+            results.namespaces[ns][metric] = { error: err.message };
+          }
+        }
+      }
+
+      // Also show processed values from the service
+      try {
+        const processed = await svc.getModelTimeSeries(modelId, hours);
+        results.processed = {
+          invocationsTotal: processed.invocations.reduce((s, p) => s + p.value, 0),
+          inputTokensTotal: processed.inputTokens.reduce((s, p) => s + p.value, 0),
+          outputTokensTotal: processed.outputTokens.reduce((s, p) => s + p.value, 0),
+          latencyAvg: processed.latency.length ? (processed.latency.reduce((s, p) => s + p.value, 0) / processed.latency.length).toFixed(0) + 'ms' : 'no data',
+          throttlesTotal: processed.throttles.reduce((s, p) => s + p.value, 0),
+          datapoints: processed.invocations.length,
+        };
+      } catch (err: any) {
+        results.processed = { error: err.message };
+      }
+
+      return json(res, 200, results);
+    }
+
+    if (url.pathname === '/api/demo-data') {
+      const hours = parseInt(url.searchParams.get('hours') || '24', 10);
+      const now = Date.now();
+      const period = hours <= 1 ? 300 : hours <= 12 ? 900 : hours <= 72 ? 3600 : 86400;
+      const points = Math.floor((hours * 3600) / period);
+      const models = ['us.anthropic.claude-sonnet-4-6', 'us.amazon.nova-micro-v1:0'];
+
+      // Quota limits (per minute)
+      const RPM_LIMIT = 1000;
+      const TPM_LIMIT = 500000;
+
+      const wave = (i: number, amp: number, offset = 0) =>
+        Math.max(0, Math.round(amp * (0.5 + 0.4 * Math.sin((i / points) * Math.PI * 4 + offset)) + amp * 0.1 * Math.random()));
+
+      // Spike function: normal usage with periodic bursts that exceed the limit
+      const spike = (i: number, base: number, limit: number, spikeEvery = 7, spikeMult = 1.4) => {
+        const normal = wave(i, base * 0.7);
+        const isSpiking = Math.floor(i / spikeEvery) % 3 === 0 && i % spikeEvery < 2;
+        return isSpiking ? Math.round(limit * spikeMult * (1 + 0.2 * Math.random())) : normal;
+      };
+
+      const periodMinutes = period / 60;
+
+      const makeSeries = (modelIdx: number) => {
+        const amp = modelIdx === 0 ? 800 : 300;
+        const rpmBase = modelIdx === 0 ? RPM_LIMIT * periodMinutes * 0.65 : RPM_LIMIT * periodMinutes * 0.25;
+        const tpmBase = modelIdx === 0 ? TPM_LIMIT * periodMinutes * 0.6 : TPM_LIMIT * periodMinutes * 0.2;
+        const ts = Array.from({ length: points }, (_, i) => ({
+          timestamp: new Date(now - (points - i) * period * 1000).toISOString(),
+          i,
+        }));
+        return {
+          modelId: models[modelIdx],
+          // Invocations spike above RPM_LIMIT * periodMinutes periodically
+          invocations: ts.map(({ timestamp, i }) => ({ timestamp, value: spike(i, rpmBase, RPM_LIMIT * periodMinutes, 6 + modelIdx, 1.35) })),
+          // Input tokens spike above TPM_LIMIT * periodMinutes periodically
+          inputTokens: ts.map(({ timestamp, i }) => ({ timestamp, value: spike(i, tpmBase * 0.7, TPM_LIMIT * periodMinutes * 0.7, 8 + modelIdx, 1.4) })),
+          outputTokens: ts.map(({ timestamp, i }) => ({ timestamp, value: spike(i, tpmBase * 0.3, TPM_LIMIT * periodMinutes * 0.3, 8 + modelIdx, 1.4) })),
+          latency: ts.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 800, modelIdx) + 400 })),
+          latencyP50: ts.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 600, modelIdx) + 300 })),
+          latencyP90: ts.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 1200, modelIdx) + 600 })),
+          latencyP99: ts.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 2000, modelIdx) + 1000 })),
+          clientErrors: ts.map(({ timestamp, i }) => ({ timestamp, value: i % 8 === 0 ? Math.round(Math.random() * 3) : 0 })),
+          serverErrors: ts.map(({ timestamp, i }) => ({ timestamp, value: i % 20 === 0 ? 1 : 0 })),
+          // Throttles appear when spiking
+          throttles: ts.map(({ timestamp, i }) => {
+            const isSpiking = Math.floor(i / (6 + modelIdx)) % 3 === 0 && i % (6 + modelIdx) < 2;
+            return { timestamp, value: isSpiking ? Math.round(5 + Math.random() * 15) : 0 };
+          }),
+        };
+      };
+
+      const agentTs = Array.from({ length: points }, (_, i) => ({
+        timestamp: new Date(now - (points - i) * period * 1000).toISOString(), i,
+      }));
+
+      return json(res, 200, {
+        series: [makeSeries(0), makeSeries(1)],
+        agentSeries: {
+          agentInvocations: agentTs.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 50) })),
+          agentLatency: agentTs.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 3000) + 2000 })),
+          agentLatencyP50: agentTs.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 2000) + 1500 })),
+          agentLatencyP90: agentTs.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 4000) + 3000 })),
+          agentLatencyP99: agentTs.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 6000) + 5000 })),
+          agentErrors: agentTs.map(({ timestamp, i }) => ({ timestamp, value: i % 15 === 0 ? 1 : 0 })),
+          agentStepCount: agentTs.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 200) + 50 })),
+          kbRetrieveCount: agentTs.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 150) + 30 })),
+          kbRetrieveLatency: agentTs.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 400) + 200 })),
+          kbErrors: agentTs.map(({ timestamp, i }) => ({ timestamp, value: i % 25 === 0 ? 1 : 0 })),
+          guardrailInvocations: agentTs.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 80) + 10 })),
+          guardrailInterventions: agentTs.map(({ timestamp, i }) => ({ timestamp, value: wave(i, 15) })),
+        },
+        usage: models.map((m, idx) => ({ modelId: m, invocations: 1200 - idx * 400, period: hours + 'h' })),
+        quotas: [
+          { quotaName: '[bedrock] Requests per minute', quotaCode: 'L-1234', value: RPM_LIMIT, unit: 'None', adjustable: true },
+          { quotaName: '[bedrock] Input tokens per minute', quotaCode: 'L-5678', value: TPM_LIMIT, unit: 'None', adjustable: true },
+          { quotaName: '[bedrock] Output tokens per minute', quotaCode: 'L-9012', value: Math.round(TPM_LIMIT * 0.4), unit: 'None', adjustable: true },
+        ],
+        agentMetrics: { agentInvocations: 342, knowledgeBaseQueries: 891 },
+        activeModels: models,
+        accountId: 'DEMO-MODE',
+        accountName: 'Demo Account',
+      });
+    }
+
     if (url.pathname === '/api/account') {
       try {
         const sts = new STSClient({ region: 'us-east-1' });
@@ -835,6 +987,7 @@ function getHTML(username: string, role: string) {
           <button class="btn-outline" data-hours="720" onclick="setRange(720)">30d</button>
         </div>
         <button class="btn" id="refreshBtn" onclick="refresh()">↻ Refresh</button>
+        <button class="btn" id="demoBtn" onclick="toggleDemo()" style="background:var(--surface2);border:1px solid var(--border)">🎭 Demo</button>
       </div>
       <div style="display:flex;align-items:center;gap:10px">
         <span style="color:var(--muted);font-size:13px">👤 ${username}</span>
@@ -1057,6 +1210,7 @@ const COLORS = ['#3b82f6','#8b5cf6','#22c55e','#eab308','#ef4444','#f97316','#06
 let currentHours = 24;
 let currentRegion = 'us-east-1';
 let currentAccountId = '';
+let demoMode = false;
 let orgAccounts = [];
 let charts = {};
 let allModels = [];
@@ -1241,6 +1395,25 @@ function toggleChat() {
   }
 }
 
+function toggleDemo() {
+  demoMode = !demoMode;
+  var btn = document.getElementById('demoBtn');
+  if (demoMode) {
+    btn.style.background = '#8b5cf6';
+    btn.style.border = '1px solid #8b5cf6';
+    btn.style.color = '#fff';
+    btn.textContent = '🎭 Demo ON';
+    document.getElementById('accountBadge').textContent = 'DEMO MODE';
+  } else {
+    btn.style.background = 'var(--surface2)';
+    btn.style.border = '1px solid var(--border)';
+    btn.style.color = 'var(--text)';
+    btn.textContent = '🎭 Demo';
+    loadAccount();
+  }
+  loadAll();
+}
+
 async function refresh() {
   const btn = document.getElementById('refreshBtn');
   btn.disabled = true; btn.textContent = '↻ Loading...';
@@ -1328,7 +1501,12 @@ async function loadTimeSeries() {
     if (data.error) { console.warn('timeseries:', data.error); return; }
     const rawSeries = data.series || [];
     const series = rawSeries.filter(s => isModelSelected(s.modelId));
+    renderModelCharts(series);
+  } catch (e) { console.error('timeseries error', e); }
+}
 
+function renderModelCharts(series) {
+  try {
     // Calculate period in minutes for per-minute rate conversion
     var h = currentHours || 24;
     var periodMinutes = h <= 1 ? 5 : h <= 12 ? 15 : h <= 72 ? 60 : 1440;
@@ -1472,7 +1650,7 @@ async function loadTimeSeries() {
     });
     makeChart('throttleRateChart', 'line', { datasets: throttleRateDatasets.length ? throttleRateDatasets : [{ label: 'No data', data: [] }] });
 
-  } catch (e) { console.error('timeseries error', e); }
+  } catch (e) { console.error('renderModelCharts error', e); }
 }
 
 async function loadUsagePie() {
@@ -1688,7 +1866,12 @@ async function loadAgentTimeSeries() {
     var res = await fetch('/api/agent-timeseries?hours=' + (currentHours || 24) + '&' + regionParam() + accountParam());
     var data = await res.json();
     if (data.error) return;
+    renderAgentCharts(data);
+  } catch (e) { console.error('agent timeseries error', e); }
+}
 
+function renderAgentCharts(data) {
+  try {
     // Agent Invocations & Errors
     var invDs = [];
     if (data.agentInvocations && data.agentInvocations.length) invDs.push({ label: 'Invocations', data: data.agentInvocations.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#3b82f6', backgroundColor: '#3b82f620', fill: true, tension: .3, pointRadius: 2, borderWidth: 2 });
@@ -1724,13 +1907,62 @@ async function loadAgentTimeSeries() {
     var kbErrDs = [];
     if (data.kbErrors && data.kbErrors.length) kbErrDs.push({ label: 'Errors', data: data.kbErrors.map(function(p) { return { x: new Date(p.timestamp), y: p.value }; }), borderColor: '#ef4444', backgroundColor: '#ef444420', fill: true, tension: .3, pointRadius: 2, borderWidth: 2 });
     makeChart('kbErrorChart', 'line', { datasets: kbErrDs.length ? kbErrDs : [{ label: 'No data', data: [] }] });
-  } catch (e) { console.error('agent timeseries error', e); }
+  } catch (e) { console.error('renderAgentCharts error', e); }
 }
 
 async function loadAll() {
   document.getElementById('lastUpdate').textContent = 'Last updated: ' + new Date().toLocaleString();
+  if (demoMode) {
+    await loadDemoData();
+    return;
+  }
   await Promise.all([loadQuotas(), loadActiveModels(), loadAgents()]);
   await Promise.all([loadTimeSeries(), loadUsagePie(), loadPredictions(), loadAgentTimeSeries()]);
+}
+
+async function loadDemoData() {
+  try {
+    var res = await fetch('/api/demo-data?hours=' + (currentHours || 24));
+    var data = await res.json();
+
+    // Populate summary cards
+    document.getElementById('totalInvocations').textContent = data.usage.reduce(function(s, u) { return s + u.invocations; }, 0).toLocaleString();
+    document.getElementById('activeModels').textContent = data.activeModels.length;
+    document.getElementById('agentInv').textContent = data.agentMetrics.agentInvocations.toLocaleString();
+    document.getElementById('kbQueries').textContent = data.agentMetrics.knowledgeBaseQueries.toLocaleString();
+
+    // Quotas
+    quotaLimits.invocations = 1000;
+    quotaLimits.inputTokens = 500000;
+    quotaLimits.outputTokens = 200000;
+    var el = document.getElementById('quotasList');
+    el.innerHTML = data.quotas.map(function(q) {
+      return '<div class="quota-row"><div class="quota-name">✓ ' + q.quotaName + '</div><div class="quota-val">' + q.value.toLocaleString() + ' ' + q.unit + '</div></div>';
+    }).join('');
+
+    // Render model charts using existing functions with demo series
+    var rawSeries = data.series;
+    var series = rawSeries.filter(function(s) { return isModelSelected(s.modelId); });
+    renderModelCharts(series);
+
+    // Render agent charts
+    renderAgentCharts(data.agentSeries);
+
+    // Pie chart
+    var usage = data.usage.filter(function(u) { return isModelSelected(u.modelId); });
+    var labels = usage.map(function(u) { return shortName(u.modelId); });
+    var values = usage.map(function(u) { return u.invocations; });
+    makeChart('pieChart', 'doughnut', {
+      labels: labels,
+      datasets: [{ data: values, backgroundColor: COLORS.slice(0, labels.length), borderWidth: 0 }],
+    }, { plugins: { legend: { position: 'right', labels: { color: '#94a3b8', font: { size: 11 }, padding: 12 } } } });
+
+    // Predictions
+    document.getElementById('predictionsList').innerHTML = data.series.map(function(s) {
+      var util = s.modelId.includes('sonnet') ? 42.3 : 18.7;
+      return '<div class="prediction-card"><div class="pred-header"><span class="pred-model">' + shortName(s.modelId) + '</span><span class="badge badge-ok">OK</span></div><div class="pred-row"><span>Utilization</span><span>' + util + '%</span></div><div class="bar-track"><div class="bar-fill" style="width:' + util + '%;background:var(--accent)"></div></div><div class="pred-rec">✓ Usage within normal limits</div></div>';
+    }).join('');
+  } catch (e) { console.error('demo error', e); }
 }
 
 loadAccount();

@@ -48,6 +48,75 @@ npm run web
 
 Open http://localhost:3000 and login with the credentials from your `.env` file.
 
+---
+
+## TAM Usage Guide — Analysing Customer Accounts
+
+As a TAM, you can use the analyser to review any customer's Bedrock usage by running it locally with assumed credentials. The app uses whatever AWS credentials are in your environment, so you just need to assume a read-only role in the customer account before starting.
+
+### Prerequisites
+
+- Node.js 20+ installed
+- `mwinit` run to get valid Midway credentials
+- Customer account ID and access via Isengard/Conduit
+
+### Step 1: Clone and install (one-time)
+
+```bash
+git clone https://github.com/mpjack22/bedrock-ai-analyser.git
+cd bedrock-ai-analyser
+npm install
+cp .env.example .env
+```
+
+### Step 2: Assume a read-only role in the customer account
+
+Use Isengard or Conduit to assume a role with CloudWatch and Bedrock read permissions in the customer account. The role needs these permissions:
+
+```
+cloudwatch:GetMetricStatistics
+cloudwatch:ListMetrics
+cloudwatch:GetMetricData
+servicequotas:ListServiceQuotas
+servicequotas:GetServiceQuota
+bedrock:ListFoundationModels
+bedrock:GetFoundationModel
+sts:GetCallerIdentity
+iam:ListAccountAliases
+```
+
+Most read-only roles (e.g. `ReadOnlyAccess` managed policy) cover these. Once assumed, your terminal will have `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` set.
+
+### Step 3: Start the analyser
+
+```bash
+npm run web
+```
+
+Open http://localhost:3000 — the account badge in the header will confirm you're looking at the correct customer account.
+
+### Step 4: Navigate the dashboard
+
+- Use the **Region** selector to switch to the region where the customer uses Bedrock
+- The **Model** filter auto-discovers which models the customer has invoked
+- Use the **time range** buttons to look at different windows (1h for recent activity, 7d for trends)
+- The **Predictions & Alerts** panel shows which quotas are at risk
+- The **Chat Assistant** can answer questions like "which models are closest to their limits?" or "when might they hit throttling?"
+
+### Step 5: When done
+
+Close the browser and stop the server (`Ctrl+C`). Your assumed credentials expire automatically (typically after 1 hour).
+
+### Notes for TAMs
+
+- Temporary credentials expire — if the dashboard stops loading data, re-assume the role and restart the server
+- The analyser only reads data — it never writes to the customer account
+- Quota increase requests submitted via the dashboard go to the customer's own Service Quotas, not yours
+- CloudWatch metrics have a 5-10 minute delay — very recent activity may not appear immediately
+- The `users.json` file (created when you add dashboard users) is local to your machine and gitignored
+
+---
+
 ### Deploy to AWS (CloudFormation)
 
 1. Download: [bedrock-ai-analyser.yaml](cloudformation/bedrock-ai-analyser.yaml)
