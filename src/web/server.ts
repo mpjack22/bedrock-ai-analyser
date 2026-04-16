@@ -923,6 +923,8 @@ function getHTML(username: string, role: string) {
     .stat-value { font-size: 28px; font-weight: 700; }
     .stat-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
     .chart-wrap { position: relative; height: 300px; }
+    .chart-wrap canvas:hover { opacity: 0.92; }
+    .chart-cw-hint { font-size: 10px; color: var(--muted); text-align: right; margin-top: 4px; opacity: 0.6; }
     .quota-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--surface2); }
     .quota-row:last-child { border-bottom: none; }
     .quota-name { font-size: 13px; font-weight: 500; flex: 1; }
@@ -1457,6 +1459,38 @@ function getChartTimeRange() {
   };
 }
 
+// Map chart IDs to their CloudWatch console URLs
+var CW_CHART_URLS = {
+  tpmChart:              function() { return cwUrl('AWS/Bedrock', 'InputTokenCount'); },
+  rpmChart:              function() { return cwUrl('AWS/Bedrock', 'Invocations'); },
+  invocationsChart:      function() { return cwUrl('AWS/Bedrock', 'Invocations'); },
+  tokensChart:           function() { return cwUrl('AWS/Bedrock', 'InputTokenCount'); },
+  latencyChart:          function() { return cwUrl('AWS/Bedrock', 'InvocationLatency'); },
+  latencyPercentilesChart: function() { return cwUrl('AWS/Bedrock', 'InvocationLatency'); },
+  errorsChart:           function() { return cwUrl('AWS/Bedrock', 'InvocationClientErrors'); },
+  tokenRatioChart:       function() { return cwUrl('AWS/Bedrock', 'InputTokenCount'); },
+  throttleRateChart:     function() { return cwUrl('AWS/Bedrock', 'InvocationThrottles'); },
+  pieChart:              function() { return cwUrl('AWS/Bedrock', 'Invocations'); },
+  agentInvChart:         function() { return cwUrl('AWS/Bedrock', 'Invocations'); },
+  agentLatencyChart:     function() { return cwUrl('AWS/Bedrock', 'Latency'); },
+  agentStepChart:        function() { return cwUrl('AWS/Bedrock', 'StepCount'); },
+  kbChart:               function() { return cwUrl('AWS/Bedrock', 'RetrieveCount'); },
+  guardrailChart:        function() { return cwUrl('AWS/Bedrock', 'GuardrailInvocations'); },
+  kbErrorChart:          function() { return cwUrl('AWS/Bedrock', 'RetrieveErrors'); },
+};
+
+function cwUrl(namespace, metricName) {
+  var region = currentRegion || 'us-east-1';
+  var h = currentHours || 24;
+  var end = new Date();
+  var start = new Date(end.getTime() - h * 60 * 60 * 1000);
+  var startStr = start.toISOString().replace(/\\.\\d{3}Z$/, 'Z');
+  var endStr = end.toISOString().replace(/\\.\\d{3}Z$/, 'Z');
+  var base = 'https://' + region + '.console.aws.amazon.com/cloudwatch/home';
+  var fragment = '#metricsV2:graph=~(metrics~(~(~\\'' + namespace + '~\\'' + metricName + '))~start~\\'' + startStr + '~end~\\'' + endStr + ')';
+  return base + '?region=' + region + fragment;
+}
+
 function makeChart(id, type, data, options = {}) {
   if (charts[id]) charts[id].destroy();
   var ctx = document.getElementById(id).getContext('2d');
@@ -1492,6 +1526,18 @@ function makeChart(id, type, data, options = {}) {
     scales: baseScales
   }, options);
   charts[id] = new Chart(ctx, { type: type, data: data, options: mergedOptions });
+
+  // Add click-to-CloudWatch if this chart has a URL mapping
+  var canvas = document.getElementById(id);
+  if (CW_CHART_URLS[id] && !demoMode) {
+    canvas.style.cursor = 'pointer';
+    canvas.title = 'Click to open in CloudWatch console';
+    canvas.onclick = function() { window.open(CW_CHART_URLS[id](), '_blank'); };
+  } else {
+    canvas.style.cursor = '';
+    canvas.title = '';
+    canvas.onclick = null;
+  }
 }
 
 async function loadTimeSeries() {
