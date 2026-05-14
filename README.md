@@ -50,10 +50,6 @@ Open http://localhost:3000 and login with the credentials from your `.env` file.
 
 ---
 
-## TAM Usage Guide — Analysing Customer Accounts
-
-As a TAM, you can use the analyser to review any customer's Bedrock usage by running it locally with assumed credentials. The app uses whatever AWS credentials are in your environment, so you just need to assume a read-only role in the customer account before starting.
-
 ### Prerequisites
 
 - Node.js 20+ installed
@@ -106,14 +102,6 @@ Open http://localhost:3000 — the account badge in the header will confirm you'
 ### Step 5: When done
 
 Close the browser and stop the server (`Ctrl+C`). Your assumed credentials expire automatically (typically after 1 hour).
-
-### Notes for TAMs
-
-- Temporary credentials expire — if the dashboard stops loading data, re-assume the role and restart the server
-- The analyser only reads data — it never writes to the customer account
-- Quota increase requests submitted via the dashboard go to the customer's own Service Quotas, not yours
-- CloudWatch metrics have a 5-10 minute delay — very recent activity may not appear immediately
-- The `users.json` file (created when you add dashboard users) is local to your machine and gitignored
 
 ---
 
